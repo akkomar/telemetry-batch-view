@@ -7,7 +7,6 @@ import java.time._
 import java.time.format.DateTimeFormatter
 import java.time.temporal.ChronoUnit
 
-import com.mozilla.telemetry.ndjson.Dataset
 import com.mozilla.telemetry.metrics._
 import com.mozilla.telemetry.utils._
 import org.apache.spark.SparkContext
@@ -20,6 +19,10 @@ import org.rogach.scallop._
 import scala.util.{Success, Try}
 
 object MainSummaryView extends BatchJobBase {
+  private final val HEKA = "heka"
+  private final val NDJSON = "ndjson"
+  private final val BIGQUERY = "bigquery"
+
   private val logger = org.apache.log4j.Logger.getLogger(this.getClass.getName)
 
   def schemaVersion: String = "v4"
@@ -258,8 +261,7 @@ object MainSummaryView extends BatchJobBase {
 
   // Configuration for command line arguments
   private class Conf(args: Array[String]) extends BaseOpts(args) {
-    val limit = opt[Int]("limit", descr = "Per-date maximum number of: files to read for --input-source=heka or rows to read for --input-source=ndjson",
-      required = false)
+    val limit = opt[Int]("limit", descr = s"Per-date maximum number of: files to read, or rows to read if --from-bigquery is set", required=false)
     val channel = opt[String]("channel", descr = "Only process data from the given channel", required = false)
     val appVersion = opt[String]("version", descr = "Only process data from the given app version", required = false)
     val allHistograms = opt[Boolean]("all-histograms", descr = "Flag to use all histograms", required = false)
@@ -271,9 +273,11 @@ object MainSummaryView extends BatchJobBase {
       default=Some("fixed"))
     val inputPartitionMultiplier = opt[Int]("input-partition-multiplier", descr="Partition multiplier for aligned read-mode", default=Some(4))
     val schemaReportLocation = opt[String]("schema-report-location", descr="Write schema.treeString to this file")
-    val inputSource = choice(Seq("heka", "ndjson"), name="input-source",
-      descr="Read raw pings from heka protobuf in S3 (heka) or newline delimited json in Google Cloud Storage (ndjson)", default=Some("heka"))
-    val inputBucket = opt[String]("input-bucket", descr="Bucket override for --input-source=ndjson", default=Some(Dataset.BUCKET))
+    val fromBigQuery = opt[Boolean](name="from-bigquery", descr=s"Flag to read raw pings BigQuery instead of heka protobuf")
+    val dataset = opt[String]("dataset", descr="Override BigQuery dataset containing decoded pings, requires --from-bigquery")
+    dependsOnAny(dataset, List(fromBigQuery))
+    val parallelism = opt[Int]("parallelism", descr="parallelism for BigQuery Storage API connector, requires --from-bigquery")
+    dependsOnAny(parallelism, List(fromBigQuery))
     val disableStopContextAtEnd = opt[Boolean]("disable-stop-context-at-end", descr = "Flag to leave spark context running", required = false)
     verify()
   }
@@ -321,35 +325,22 @@ object MainSummaryView extends BatchJobBase {
         val ignoredCount = sc.accumulator(0, "Number of Records Ignored")
         val processedCount = sc.accumulator(0, "Number of Records Processed")
 
-        val telemetrySource = submissionDate match {
-          case d if d < "20161012" => "telemetry-oldinfra"
-          case _ => "telemetry"
-        }
-
         // if `fixed`, then data is read in fixed 268MB blocks
         val numPartitions = conf.readMode() match {
           case "aligned" => Some(sc.defaultParallelism * conf.inputPartitionMultiplier())
           case _ => None
         }
 
-        val ds = Dataset(
-          telemetrySource,
-          Some(submissionDate),
-          conf.inputBucket(),
-          Map[String, PartialFunction[String, Boolean]](
-            "document_namespace" ->  { case "telemetry" => true},
-            "document_version" -> { case "4" => true },
-            "document_type" -> { case dt if dt == filterDocType => true },
-            "normalized_app_name" -> { case "Firefox" => true }
-          ) ++ filterChannel.map(
-            expect => ("normalized_channel", { case channel if channel == expect => true }: PartialFunction[String, Boolean])
-          ) ++ filterVersion.map(
-            expect => ("app_version", { case v if v == expect => true }: PartialFunction[String, Boolean])
-          )
+        val ds = DatasetShim(
+          submissionDate=submissionDate,
+          documentType=filterDocType,
+          normalizedChannel=filterChannel,
+          appVersion=filterVersion
         )
-        val messages = conf.inputSource() match {
-          case "ndjson" => ds.records(conf.limit.toOption)
-          case "heka" => ds.asHeka.records(conf.limit.toOption, numPartitions).map(_.toJValue)
+
+        val messages = conf.fromBigQuery.toOption match {
+          case Some(true) => ds.fromBigQuery(conf.limit.toOption, conf.parallelism.toOption, conf.dataset.toOption)
+          case _ => ds.fromHeka(conf.limit.toOption, numPartitions)
         }
 
         // Note we cannot just use 'partitionBy' below to automatically populate
@@ -407,7 +398,7 @@ object MainSummaryView extends BatchJobBase {
         if ((1.0 * recordsIgnored) / recordsSeen > MaxFractionIgnoredPings) {
           throw TooManyRecordsIgnoredException(
             s"More records ignored than are allowed. Ignored $recordsIgnored out of $recordsSeen records.",
-            conf.outputBucket(), keyPrefix)
+            outputBucket, keyPrefix)
         }
 
         if (shouldStopContextAtEnd(spark) && !conf.disableStopContextAtEnd()) { spark.stop() }
@@ -415,7 +406,7 @@ object MainSummaryView extends BatchJobBase {
     } catch {
       // Delete incomplete data
       case e@TooManyRecordsIgnoredException(_, bucket, prefix) =>
-        deletePrefix(bucket, prefix)
+        hadoopDelete(s"$bucket/$prefix", recursive = true)
         throw e
     }
   }

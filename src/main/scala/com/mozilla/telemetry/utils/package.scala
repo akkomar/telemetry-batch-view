@@ -179,4 +179,13 @@ package object utils{
     val path = new Path(pathString)
     FileSystem.get(path.toUri, new Configuration()).exists(path)
   }
+
+  /** Delete file or directory in Hadoop filesystems
+    *
+    * @param pathString path to the directory or file to delete using hadoop
+    */
+  def hadoopDelete(pathString: String, recursive: Boolean): Boolean = {
+    val path = new Path(pathString)
+    FileSystem.get(path.toUri, new Configuration()).delete(path, recursive)
+  }
 }
